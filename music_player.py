@@ -7,13 +7,15 @@ import wave
 import datetime
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import TypedDict
+import json
 
 import numpy as np
 from mutagen.mp3 import MP3
 from mutagen import MutagenError
 
 from PyQt6.QtCore import Qt, QDir, QUrl, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QAction, QColor, QPainter, QPen, QFileSystemModel
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QPainter, QPen, QFileSystemModel
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -39,7 +41,22 @@ try:
     import miniaudio
     HAS_MINIAUDIO = True
 except ImportError:
+    miniaudio = None
     HAS_MINIAUDIO = False
+
+
+class WaveformAnalysis(TypedDict):
+    levels: np.ndarray
+    left_levels: np.ndarray
+    right_levels: np.ndarray
+    levels_hz: int
+    bpm_times_ms: np.ndarray
+    bpm_values: np.ndarray
+
+
+class LoudnessMetrics(TypedDict):
+    rms: float
+    peak: float
 
 
 def fmt_seconds(seconds: int) -> str:
@@ -66,7 +83,8 @@ class Track:
 class WaveformSegmentLoader(QThread):
     segment_partial = pyqtSignal(int, int, object, int)
     segment_final = pyqtSignal(int, int, object, int)
-    rms_ready = pyqtSignal(float, int)
+    analysis_ready = pyqtSignal(object, int)
+    loudness_ready = pyqtSignal(float, float, int)
     error = pyqtSignal(str, int)
 
     def __init__(
@@ -124,6 +142,146 @@ class WaveformSegmentLoader(QThread):
             peaks /= pmax
         return peaks
 
+    @staticmethod
+    def _to_window_max(samples: np.ndarray, target_points: int) -> np.ndarray:
+        if samples.size == 0:
+            return np.empty(0, dtype=np.float32)
+        target_points = max(1, target_points)
+        spp = max(1, samples.size // target_points)
+        used = (samples.size // spp) * spp
+        if used <= 0:
+            values = np.abs(samples).astype(np.float32)
+        else:
+            values = np.abs(samples[:used].reshape(-1, spp)).max(axis=1).astype(np.float32)
+        vmax = float(values.max()) if values.size else 0.0
+        if vmax > 0:
+            values /= vmax
+        return values
+
+    def _estimate_local_bpms(self, levels: np.ndarray, levels_hz: int) -> tuple[np.ndarray, np.ndarray]:
+        if levels.size < levels_hz * 4:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32)
+        smooth_len = max(3, levels_hz // 50)
+        smooth_kernel = np.ones(smooth_len, dtype=np.float32) / smooth_len
+        smoothed = np.convolve(levels, smooth_kernel, mode="same").astype(np.float32)
+        onset = np.maximum(0.0, np.diff(smoothed, prepend=smoothed[0])).astype(np.float32)
+        local_mean_len = max(8, levels_hz // 8)
+        local_mean_kernel = np.ones(local_mean_len, dtype=np.float32) / local_mean_len
+        onset = np.maximum(0.0, onset - np.convolve(onset, local_mean_kernel, mode="same"))
+        onset -= float(onset.mean())
+        onset_std = float(onset.std())
+        if onset_std <= 1e-6:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32)
+        onset /= onset_std
+
+        min_bpm = 70.0
+        max_bpm = 190.0
+        min_lag = max(1, int(levels_hz * 60.0 / max_bpm))
+        max_lag = max(min_lag + 1, int(levels_hz * 60.0 / min_bpm))
+        window_frames = min(len(onset), max(levels_hz * 6, levels_hz * 10))
+        step_frames = max(1, levels_hz // 4)
+        if window_frames <= max_lag + 1:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32)
+
+        bpm_times: list[int] = []
+        bpm_values: list[float] = []
+        window_fn = np.hanning(window_frames).astype(np.float32)
+        previous_bpm = 0.0
+
+        def fold_bpm(bpm: float) -> float:
+            while bpm < 80.0:
+                bpm *= 2.0
+            while bpm > 175.0:
+                bpm *= 0.5
+            return bpm
+
+        def continuity_distance(candidate: float, reference: float) -> float:
+            if reference <= 0.0:
+                return 0.0
+            return min(
+                abs(candidate - reference),
+                abs(candidate - (reference * 0.5)),
+                abs(candidate - (reference * 2.0)),
+            )
+
+        for end in range(window_frames, len(onset) + 1, step_frames):
+            segment = onset[end - window_frames:end] * window_fn
+            corr_values: list[float] = []
+            candidate_bpms: list[float] = []
+            for lag in range(min_lag, max_lag + 1):
+                base = float(np.dot(segment[:-lag], segment[lag:]))
+                if base <= 0.0:
+                    corr_values.append(0.0)
+                    candidate_bpms.append(fold_bpm((60.0 * levels_hz) / lag))
+                    continue
+                score = base
+                half_lag = lag // 2
+                double_lag = lag * 2
+                if half_lag >= min_lag:
+                    score += 0.35 * float(np.dot(segment[:-half_lag], segment[half_lag:]))
+                if double_lag < len(segment):
+                    score += 0.20 * float(np.dot(segment[:-double_lag], segment[double_lag:]))
+                bpm = fold_bpm((60.0 * levels_hz) / lag)
+                if previous_bpm > 0.0:
+                    score *= max(0.55, 1.0 - (continuity_distance(bpm, previous_bpm) / 90.0))
+                corr_values.append(score)
+                candidate_bpms.append(bpm)
+            corr = np.asarray(corr_values, dtype=np.float32)
+            if corr.size == 0:
+                continue
+            best_indices = np.argsort(corr)[-5:]
+            if best_indices.size == 0:
+                continue
+            best_corr = float(corr[best_indices[-1]])
+            if best_corr <= 0.0:
+                continue
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for idx in best_indices:
+                score = float(corr[int(idx)])
+                if score <= 0.0:
+                    continue
+                bpm = candidate_bpms[int(idx)]
+                weighted_sum += bpm * score
+                weight_total += score
+            if weight_total <= 0.0:
+                continue
+            bpm = weighted_sum / weight_total
+            if bpm_values:
+                recent = bpm_values[-4:]
+                bpm = float((0.65 * bpm) + (0.35 * float(np.median(recent))))
+            previous_bpm = bpm
+            bpm_times.append(int(self.start_ms + (((end - (window_frames // 2)) / levels_hz) * 1000.0)))
+            bpm_values.append(float(bpm))
+
+        if not bpm_times:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32)
+        return np.asarray(bpm_times, dtype=np.int32), np.asarray(bpm_values, dtype=np.float32)
+
+    def _build_analysis_payload(
+        self, left_samples: np.ndarray, right_samples: np.ndarray, mono_samples: np.ndarray
+    ) -> WaveformAnalysis:
+        levels_hz = 200
+        level_points = max(1, int(math.ceil(((self.end_ms - self.start_ms) / 1000.0) * levels_hz)))
+        levels = self._to_window_max(mono_samples, level_points)
+        left_levels = self._to_window_max(left_samples, level_points)
+        right_levels = self._to_window_max(right_samples, level_points)
+        if levels.size:
+            levels = np.sqrt(levels).astype(np.float32, copy=False)
+        if left_levels.size:
+            left_levels = np.sqrt(left_levels).astype(np.float32, copy=False)
+        if right_levels.size:
+            right_levels = np.sqrt(right_levels).astype(np.float32, copy=False)
+        bpm_times_ms, bpm_values = self._estimate_local_bpms(levels, levels_hz)
+        return {
+            "levels": levels.astype(np.float32, copy=False),
+            "left_levels": left_levels.astype(np.float32, copy=False),
+            "right_levels": right_levels.astype(np.float32, copy=False),
+            "levels_hz": levels_hz,
+            "bpm_times_ms": bpm_times_ms,
+            "bpm_values": bpm_values,
+        }
+
     def _emit_from_samples(self, left_samples: np.ndarray, right_samples: np.ndarray):
         if left_samples.size == 0 or right_samples.size == 0:
             self.segment_final.emit(self.start_ms, self.end_ms, None, self.request_id)
@@ -131,18 +289,22 @@ class WaveformSegmentLoader(QThread):
         left_peaks = self._to_peaks(left_samples, self.target_peaks)
         right_peaks = self._to_peaks(right_samples, self.target_peaks)
         peaks = (left_peaks, right_peaks)
-        self.segment_partial.emit(self.start_ms, self.end_ms, peaks, self.request_id)
-        self.segment_final.emit(self.start_ms, self.end_ms, peaks, self.request_id)
-
         mono = 0.5 * (left_samples + right_samples)
+        self.analysis_ready.emit(self._build_analysis_payload(left_samples, right_samples, mono), self.request_id)
         rms = float(np.sqrt(np.mean(mono * mono)))
         abs_max = float(np.max(np.abs(mono)))
         if abs_max > 0:
             rms /= abs_max
-        self.rms_ready.emit(rms, self.request_id)
+        self.loudness_ready.emit(rms, abs_max, self.request_id)
+        self.segment_final.emit(self.start_ms, self.end_ms, peaks, self.request_id)
 
     def _run_miniaudio_segment(self):
         try:
+            backend = miniaudio
+            if backend is None:
+                self.error.emit("Waveform backend missing: install miniaudio.", self.request_id)
+                self.segment_final.emit(self.start_ms, self.end_ms, None, self.request_id)
+                return
             window_sec = max(0.001, (self.end_ms - self.start_ms) / 1000.0)
             decode_rate = self._decode_rate_for_window(window_sec, self.target_peaks)
             start_frame = int((self.start_ms / 1000.0) * decode_rate)
@@ -152,9 +314,9 @@ class WaveformSegmentLoader(QThread):
             collected_left: list[np.ndarray] = []
             collected_right: list[np.ndarray] = []
 
-            stream = miniaudio.stream_file(
+            stream = backend.stream_file(
                 self.filepath,
-                output_format=miniaudio.SampleFormat.SIGNED16,
+                output_format=backend.SampleFormat.SIGNED16,
                 nchannels=2,
                 sample_rate=decode_rate,
                 frames_to_read=chunk_frames,
@@ -185,15 +347,6 @@ class WaveformSegmentLoader(QThread):
                 collected_left.append(left)
                 collected_right.append(right)
                 read_frames += take
-
-                if len(collected_left) % 3 == 0:
-                    tmp_left = np.concatenate(collected_left)
-                    tmp_right = np.concatenate(collected_right)
-                    peaks = (
-                        self._to_peaks(tmp_left, self.target_peaks),
-                        self._to_peaks(tmp_right, self.target_peaks),
-                    )
-                    self.segment_partial.emit(self.start_ms, self.end_ms, peaks, self.request_id)
 
             if self._cancelled:
                 return
@@ -292,6 +445,21 @@ class WaveformView(QWidget):
         self._follow_playback = False
         self._paint_hz = 0.0
         self._last_paint_ts = 0.0
+        self._levels = np.empty(0, dtype=np.float32)
+        self._left_levels = np.empty(0, dtype=np.float32)
+        self._right_levels = np.empty(0, dtype=np.float32)
+        self._levels_hz = 0
+        self._bpm_times_ms = np.empty(0, dtype=np.int32)
+        self._bpm_values = np.empty(0, dtype=np.float32)
+        self._current_level = 0.0
+        self._current_left_level = 0.0
+        self._current_right_level = 0.0
+        self._display_left_level = 0.0
+        self._display_right_level = 0.0
+        self._peak_hold_left = 0.0
+        self._peak_hold_right = 0.0
+        self._peak_hold_last_ts = time.perf_counter()
+        self._current_bpm = 0.0
 
         self.setMinimumHeight(100)
         self.setMouseTracking(True)
@@ -355,6 +523,37 @@ class WaveformView(QWidget):
         self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
         self.update()
 
+    def clear_analysis(self):
+        self._levels = np.empty(0, dtype=np.float32)
+        self._left_levels = np.empty(0, dtype=np.float32)
+        self._right_levels = np.empty(0, dtype=np.float32)
+        self._levels_hz = 0
+        self._bpm_times_ms = np.empty(0, dtype=np.int32)
+        self._bpm_values = np.empty(0, dtype=np.float32)
+        self._current_level = 0.0
+        self._current_left_level = 0.0
+        self._current_right_level = 0.0
+        self._display_left_level = 0.0
+        self._display_right_level = 0.0
+        self._peak_hold_left = 0.0
+        self._peak_hold_right = 0.0
+        self._peak_hold_last_ts = time.perf_counter()
+        self._current_bpm = 0.0
+        self.update()
+
+    def set_analysis_data(self, analysis: WaveformAnalysis | None):
+        if not analysis:
+            self.clear_analysis()
+            return
+        self._levels = np.asarray(analysis["levels"], dtype=np.float32)
+        self._left_levels = np.asarray(analysis["left_levels"], dtype=np.float32)
+        self._right_levels = np.asarray(analysis["right_levels"], dtype=np.float32)
+        self._levels_hz = int(analysis["levels_hz"])
+        self._bpm_times_ms = np.asarray(analysis["bpm_times_ms"], dtype=np.int32)
+        self._bpm_values = np.asarray(analysis["bpm_values"], dtype=np.float32)
+        self._update_analysis_position()
+        self.update()
+
     def _set_default_initial_view(self):
         if self._duration_ms <= 0:
             self._view_start_ms = 0
@@ -371,6 +570,7 @@ class WaveformView(QWidget):
     def set_loading(self):
         self._loading = True
         self._status = "Loading waveform ..."
+        self.clear_analysis()
         self.update()
 
     def clear_for_view(self, start_ms: int, end_ms: int):
@@ -379,6 +579,7 @@ class WaveformView(QWidget):
         self._peaks = None
         self._loading = True
         self._status = "Loading waveform ..."
+        self.clear_analysis()
         self.update()
 
     def set_error(self, msg: str):
@@ -410,10 +611,53 @@ class WaveformView(QWidget):
 
     def set_position(self, ms: int):
         self._position_ms = max(0, ms)
+        self._update_analysis_position()
         if not self._drag_seek:
             if self._auto_scroll() and not self._follow_playback:
                 self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
         self.update()
+
+    def _update_analysis_position(self):
+        now = time.perf_counter()
+        decay_dt = max(0.0, now - self._peak_hold_last_ts)
+        self._peak_hold_last_ts = now
+        self._current_level = 0.0
+        self._current_left_level = 0.0
+        self._current_right_level = 0.0
+        if self._levels_hz > 0 and self._levels.size:
+            idx = int((self._position_ms / 1000.0) * self._levels_hz)
+            idx = max(0, min(len(self._levels) - 1, idx))
+            self._current_level = float(self._levels[idx])
+            if self._left_levels.size:
+                self._current_left_level = float(self._left_levels[idx])
+            if self._right_levels.size:
+                self._current_right_level = float(self._right_levels[idx])
+        # Smooth the visible meters so they feel calmer than the raw analysis stream.
+        attack_per_second = 4.5
+        release_per_second = 1.4
+        left_rate = attack_per_second if self._current_left_level > self._display_left_level else release_per_second
+        right_rate = attack_per_second if self._current_right_level > self._display_right_level else release_per_second
+        left_mix = min(1.0, decay_dt * left_rate)
+        right_mix = min(1.0, decay_dt * right_rate)
+        self._display_left_level += (self._current_left_level - self._display_left_level) * left_mix
+        self._display_right_level += (self._current_right_level - self._display_right_level) * right_mix
+        if self._display_left_level < 0.008:
+            self._display_left_level = 0.0
+        if self._display_right_level < 0.008:
+            self._display_right_level = 0.0
+        decay_per_second = 0.16
+        self._peak_hold_left = max(0.0, self._peak_hold_left - (decay_per_second * decay_dt))
+        self._peak_hold_right = max(0.0, self._peak_hold_right - (decay_per_second * decay_dt))
+        self._peak_hold_left = max(self._peak_hold_left, self._current_left_level, self._display_left_level)
+        self._peak_hold_right = max(self._peak_hold_right, self._current_right_level, self._display_right_level)
+
+        self._current_bpm = 0.0
+        if self._bpm_times_ms.size and self._bpm_values.size:
+            idx = int(np.searchsorted(self._bpm_times_ms, self._position_ms, side="right") - 1)
+            if 0 <= idx < len(self._bpm_values):
+                start_idx = max(0, idx - 3)
+                recent = self._bpm_values[start_idx:idx + 1]
+                self._current_bpm = float(np.median(recent))
 
     def set_zoom_level(self, level: int):
         level = max(1, min(100, int(level)))
@@ -430,34 +674,38 @@ class WaveformView(QWidget):
         self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
         self.update()
 
-    def wheelEvent(self, event):
-        if event.angleDelta().y() > 0:
+    def wheelEvent(self, a0):
+        assert a0 is not None
+        if a0.angleDelta().y() > 0:
             self.set_zoom_level(self._zoom_level + 2)
         else:
             self.set_zoom_level(self._zoom_level - 2)
-        event.accept()
+        a0.accept()
 
-    def mouseDoubleClickEvent(self, event):
+    def mouseDoubleClickEvent(self, a0):
+        assert a0 is not None
         self.reset_zoom()
-        event.accept()
+        a0.accept()
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.RightButton:
+    def mousePressEvent(self, a0):
+        assert a0 is not None
+        if a0.button() == Qt.MouseButton.RightButton:
             self._drag_pan = True
-            self._pan_start_x = int(event.position().x())
+            self._pan_start_x = int(a0.position().x())
             self._pan_start_range = (self._view_start_ms, self._view_end_ms)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
-        if event.button() == Qt.MouseButton.LeftButton:
+        if a0.button() == Qt.MouseButton.LeftButton:
             self._drag_seek = True
-            self._edge_anchor_x = int(event.position().x())
+            self._edge_anchor_x = int(a0.position().x())
             self._update_edge_scroll_state(self._edge_anchor_x)
-            ms = self._x_to_ms(event.position().x())
+            ms = self._x_to_ms(a0.position().x())
             self.seek_preview.emit(ms)
             self.update()
 
-    def mouseMoveEvent(self, event):
-        x = int(event.position().x())
+    def mouseMoveEvent(self, a0):
+        assert a0 is not None
+        x = int(a0.position().x())
         self._hover_x = x
         if self._drag_seek:
             self._edge_anchor_x = x
@@ -466,7 +714,7 @@ class WaveformView(QWidget):
             self.seek_preview.emit(ms)
             self._position_ms = ms
         elif self._drag_pan and self._duration_ms > 0:
-            dx = int(event.position().x()) - self._pan_start_x
+            dx = int(a0.position().x()) - self._pan_start_x
             span = max(1, self._pan_start_range[1] - self._pan_start_range[0])
             ms_per_px = span / max(1, self.width())
             shift = int(dx * ms_per_px)
@@ -479,26 +727,27 @@ class WaveformView(QWidget):
             self._update_edge_scroll_state(-1)
         self.update()
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.RightButton and self._drag_pan:
+    def mouseReleaseEvent(self, a0):
+        assert a0 is not None
+        if a0.button() == Qt.MouseButton.RightButton and self._drag_pan:
             self._drag_pan = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
-        if event.button() == Qt.MouseButton.LeftButton and self._drag_seek:
+        if a0.button() == Qt.MouseButton.LeftButton and self._drag_seek:
             self._drag_seek = False
             self._update_edge_scroll_state(-1)
             ms = self._position_ms
             self.seek_commit.emit(ms)
             self.update()
 
-    def leaveEvent(self, event):
+    def leaveEvent(self, a0):
         self._hover_x = -1
         if not self._drag_seek:
             self._update_edge_scroll_state(-1)
         self.update()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
+    def resizeEvent(self, a0):
+        super().resizeEvent(a0)
         if self._duration_ms > 0:
             self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
 
@@ -658,7 +907,7 @@ class WaveformView(QWidget):
         ratio = (ms - self._view_start_ms) / span
         return int(max(0.0, min(1.0, ratio)) * self.width())
 
-    def paintEvent(self, event):
+    def paintEvent(self, a0):
         now = time.perf_counter()
         if self._last_paint_ts > 0.0:
             delta = now - self._last_paint_ts
@@ -671,12 +920,18 @@ class WaveformView(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         w = self.width()
         h = self.height()
+        hud_h = 36
         mini_h = 8
-        draw_h = h - mini_h
-        center = draw_h // 2
+        draw_top = hud_h
+        draw_h = max(24, h - mini_h - draw_top)
+        draw_bottom = draw_top + draw_h
+        center = draw_top + (draw_h // 2)
+        wave_half = max(1, (draw_h // 2) - 3)
 
         p.fillRect(0, 0, w, h, QColor(16, 16, 16))
+        p.fillRect(0, 0, w, hud_h, QColor(10, 10, 10))
         p.setPen(QPen(QColor(42, 42, 42), 1))
+        p.drawLine(0, hud_h - 1, w, hud_h - 1)
         p.drawLine(0, center, w, center)
 
         if self._peaks is not None and self._duration_ms > 0:
@@ -701,8 +956,8 @@ class WaveformView(QWidget):
                 idx = int(max(0.0, min(1.0, r)) * (n - 1))
                 lv = float(left_peaks[idx])
                 rv = float(right_peaks[idx])
-                lamp = max(1, int(lv * (center - 3)))
-                ramp = max(1, int(rv * (center - 3)))
+                lamp = max(1, int(lv * wave_half))
+                ramp = max(1, int(rv * wave_half))
                 oamp = min(lamp, ramp)
                 p.setPen(blue)
                 p.drawLine(x, center - lamp, x, center + lamp)
@@ -714,30 +969,113 @@ class WaveformView(QWidget):
             msg = self._status
             if msg:
                 p.setPen(QPen(QColor(120, 120, 120), 1))
-                p.drawText(0, 0, w, draw_h, Qt.AlignmentFlag.AlignCenter, msg)
+                p.drawText(0, draw_top, w, draw_h, Qt.AlignmentFlag.AlignCenter, msg)
 
-        self._draw_time_scale(p, w)
+        self._draw_time_scale(p, w, draw_top)
 
         if self._duration_ms > 0:
             pos_x = self._ms_to_x(self._position_ms)
             p.setPen(QPen(QColor(255, 255, 255), 2))
-            p.drawLine(pos_x, 0, pos_x, draw_h - 1)
+            p.drawLine(pos_x, draw_top, pos_x, draw_bottom - 1)
 
         if self._hover_x >= 0 and not self._drag_pan and not self._drag_seek:
             p.setPen(QPen(QColor(255, 255, 255, 50), 1))
-            p.drawLine(self._hover_x, 0, self._hover_x, draw_h - 1)
+            p.drawLine(self._hover_x, draw_top, self._hover_x, draw_bottom - 1)
 
-        self._draw_perf_overlay(p, w)
+        self._draw_level_meter(p, w, hud_h)
+        self._draw_recent_level_graph(p, hud_h)
+        self._draw_perf_overlay(p, w, hud_h)
         self._draw_minimap(p, w, h, mini_h)
         p.end()
 
-    def _draw_perf_overlay(self, p: QPainter, w: int):
-        label = f"{self._paint_hz:4.1f} Hz" if self._paint_hz > 0 else "--.- Hz"
-        p.fillRect(w - 78, 4, 72, 16, QColor(0, 0, 0, 140))
+    def _draw_stereo_meter_row(self, p: QPainter, x: int, y: int, w: int, h: int, label: str, level: float, peak_hold: float):
         p.setPen(QPen(QColor(220, 220, 220), 1))
-        p.drawText(w - 74, 16, label)
+        p.drawText(x, y + h - 1, label)
+        meter_x = x + 12
+        meter_w = max(40, w - 12)
+        p.fillRect(meter_x, y, meter_w, h, QColor(10, 10, 10, 235))
+        green_w = int(meter_w * 0.68)
+        yellow_w = int(meter_w * 0.18)
+        red_w = meter_w - green_w - yellow_w
+        fill_w = int(max(0.0, min(1.0, level)) * meter_w)
+        if fill_w > 0:
+            green_fill = min(fill_w, green_w)
+            if green_fill > 0:
+                p.fillRect(meter_x, y, green_fill, h, QColor(70, 255, 90, 220))
+            yellow_fill = min(max(0, fill_w - green_w), yellow_w)
+            if yellow_fill > 0:
+                p.fillRect(meter_x + green_w, y, yellow_fill, h, QColor(255, 210, 70, 220))
+            red_fill = min(max(0, fill_w - green_w - yellow_w), red_w)
+            if red_fill > 0:
+                p.fillRect(meter_x + green_w + yellow_w, y, red_fill, h, QColor(255, 80, 80, 220))
+        peak_x = meter_x + min(meter_w - 1, max(0, int(max(0.0, min(1.0, peak_hold)) * meter_w)))
+        p.setPen(QPen(QColor(90, 170, 255), 2))
+        p.drawLine(peak_x, y, peak_x, y + h)
+        p.setPen(QPen(QColor(55, 55, 55), 1))
+        for divider in (green_w, green_w + yellow_w):
+            p.drawLine(meter_x + divider, y, meter_x + divider, y + h)
+        p.setPen(QPen(QColor(220, 220, 220), 1))
+        p.drawRect(meter_x, y, meter_w, h)
 
-    def _draw_time_scale(self, p: QPainter, w: int):
+    def _draw_meter_scale(self, p: QPainter, meter_x: int, meter_w: int, y: int):
+        marks = [(-36, 0.0), (-24, 0.33), (-12, 0.66), (-6, 0.82), (0, 1.0)]
+        p.setPen(QPen(QColor(170, 170, 170), 1))
+        for db, ratio in marks:
+            x = meter_x + int(ratio * meter_w)
+            p.drawLine(x, y + 9, x, y + 11)
+            label_x = x - 9 if db < 0 else x - 3
+            p.drawText(label_x, y + 8, f"{db}")
+
+    def _draw_level_meter(self, p: QPainter, w: int, hud_h: int):
+        meter_x = 10
+        meter_w = max(120, w - 250)
+        row_h = 8
+        gap = 4
+        base_y = max(12, (hud_h - ((row_h * 2) + gap)) // 2)
+        meter_bar_x = meter_x + 12
+        meter_bar_w = max(40, meter_w - 12)
+        self._draw_meter_scale(p, meter_bar_x, meter_bar_w, 1)
+        self._draw_stereo_meter_row(p, meter_x, base_y, meter_w, row_h, "L", self._display_left_level, self._peak_hold_left)
+        self._draw_stereo_meter_row(
+            p, meter_x, base_y + row_h + gap, meter_w, row_h, "R", self._display_right_level, self._peak_hold_right
+        )
+
+    def _draw_recent_level_graph(self, p: QPainter, hud_h: int):
+        box_w = 90
+        box_h = max(20, hud_h - 8)
+        box_x = 12 + max(120, self.width() - 250) + 10
+        box_y = (hud_h - box_h) // 2
+        p.fillRect(box_x, box_y, box_w, box_h, QColor(0, 0, 0, 150))
+        p.setPen(QPen(QColor(80, 80, 80), 1))
+        p.drawRect(box_x, box_y, box_w, box_h)
+        if self._levels_hz <= 0 or not self._levels.size:
+            return
+        history_ms = 500
+        end_idx = int((self._position_ms / 1000.0) * self._levels_hz)
+        span = max(1, int((history_ms / 1000.0) * self._levels_hz))
+        start_idx = max(0, end_idx - span + 1)
+        window = self._levels[start_idx:end_idx + 1]
+        if window.size <= 1:
+            return
+        p.setPen(QPen(QColor(80, 255, 160), 1))
+        last_x = box_x
+        last_y = box_y + box_h - int(float(window[0]) * (box_h - 4)) - 2
+        for i in range(1, len(window)):
+            x = box_x + int((i / max(1, len(window) - 1)) * (box_w - 1))
+            y = box_y + box_h - int(float(window[i]) * (box_h - 4)) - 2
+            p.drawLine(last_x, last_y, x, y)
+            last_x, last_y = x, y
+
+    def _draw_perf_overlay(self, p: QPainter, w: int, hud_h: int):
+        hz_label = f"{self._paint_hz:4.1f} Hz" if self._paint_hz > 0 else "--.- Hz"
+        bpm_label = f"{self._current_bpm:5.1f} BPM" if self._current_bpm > 0 else "--.- BPM"
+        box_h = max(24, hud_h - 6)
+        p.fillRect(w - 114, 3, 108, box_h, QColor(0, 0, 0, 140))
+        p.setPen(QPen(QColor(220, 220, 220), 1))
+        p.drawText(w - 110, 15, hz_label)
+        p.drawText(w - 110, min(hud_h - 5, 28), bpm_label)
+
+    def _draw_time_scale(self, p: QPainter, w: int, y_offset: int):
         if self._duration_ms <= 0:
             return
         start_s = self._view_start_ms / 1000.0
@@ -752,13 +1090,13 @@ class WaveformView(QWidget):
                 step = c
                 break
         first = math.ceil(start_s / step) * step
-        p.setPen(QPen(QColor(95, 95, 95), 1))
-        y = 9
+        p.setPen(QPen(QColor(255, 255, 255), 1))
+        y = y_offset + 9
         t = first
         while t <= end_s + 0.001:
             x = int(((t - start_s) / visible_s) * w)
             if 0 <= x < w:
-                p.drawLine(x, 0, x, 5)
+                p.drawLine(x, y_offset, x, y_offset + 5)
                 p.drawText(x + 3, y, fmt_seconds(int(t)))
             t += step
 
@@ -774,6 +1112,9 @@ class WaveformView(QWidget):
 
 class MusicPlayer(QMainWindow):
     MAX_WAVEFORM_PEAKS = 600_000
+    DEFAULT_WAVEFORM_WINDOW_MS = 10 * 1000
+    DEFAULT_REFRESH_FPS = 60
+    REFRESH_FPS_OPTIONS = (30, 60, 120, 144)
 
     def __init__(self):
         super().__init__()
@@ -781,27 +1122,29 @@ class MusicPlayer(QMainWindow):
         self.setGeometry(100, 100, 1200, 760)
         self.setMinimumSize(920, 620)
 
+        self.config = self._load_config()
         self.playlist: list[Track] = []
         self.current_track_index = -1
-        self.last_folder = self._load_last_folder()
+        self.last_folder = self._config_last_folder()
+        self.refresh_fps = self._config_refresh_fps()
         self.loader: WaveformSegmentLoader | None = None
         self.waveform_request_id = 0
         self._waveform_request_key_by_id: dict[int, tuple] = {}
         self._waveform_request_meta_by_id: dict[int, dict] = {}
         self._active_waveform_request_key: tuple | None = None
-        self._waveform_cache: OrderedDict[tuple, tuple[object, float | None]] = OrderedDict()
+        self._waveform_cache: OrderedDict[tuple, tuple[object, LoudnessMetrics | None, WaveformAnalysis | None]] = OrderedDict()
         self._pending_waveform_request: tuple[int, int, str] | None = None
         self._pending_waveform_force = False
         self._waveform_request_timer = QTimer(self)
         self._waveform_request_timer.setSingleShot(True)
         self._waveform_request_timer.timeout.connect(self._flush_waveform_request)
-        self.dynamic_waveform_enabled = True
-        self.default_10sec_view_enabled = True
         self._wave_loaded_for_track = False
         self._current_waveform_target_peaks = 0
-        self.track_rms: dict[str, float] = {}
+        self.track_loudness: dict[str, LoudnessMetrics] = {}
         self.normalize_enabled = True
-        self.target_rms = 0.20
+        self.target_rms = 0.24
+        self.target_peak = 0.98
+        self.max_normalize_gain = 1.8
         self.slider_drag_preview = False
         self._last_displayed_second = -1
         self._playback_anchor_ms = 0
@@ -817,9 +1160,10 @@ class MusicPlayer(QMainWindow):
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.errorOccurred.connect(self._on_player_error)
         self._playback_refresh_timer = QTimer(self)
-        self._playback_refresh_timer.setInterval(16)
         self._playback_refresh_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._playback_refresh_timer.timeout.connect(self._refresh_playback_view)
+        self._refresh_rate_actions: dict[int, QAction] = {}
+        self._set_refresh_fps(self.refresh_fps, persist=False)
 
         self._build_ui()
         self._apply_style()
@@ -827,22 +1171,57 @@ class MusicPlayer(QMainWindow):
 
     CFG_PATH = os.path.join(os.path.expanduser("~"), ".music_player_config")
 
-    def _load_last_folder(self) -> str | None:
+    def _load_config(self) -> dict[str, object]:
+        if not os.path.exists(self.CFG_PATH):
+            return {}
         try:
-            if os.path.exists(self.CFG_PATH):
-                value = open(self.CFG_PATH, "r", encoding="utf-8").read().strip()
-                if os.path.isdir(value):
-                    return value
+            with open(self.CFG_PATH, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            if not raw:
+                return {}
+            if raw.startswith("{"):
+                loaded = json.loads(raw)
+                return loaded if isinstance(loaded, dict) else {}
+            if os.path.isdir(raw):
+                return {"last_folder": raw}
         except Exception:
             pass
+        return {}
+
+    def _config_last_folder(self) -> str | None:
+        value = self.config.get("last_folder")
+        if isinstance(value, str) and os.path.isdir(value):
+            return value
         return None
 
-    def _save_last_folder(self, path: str):
+    def _config_refresh_fps(self) -> int:
+        value = self.config.get("refresh_fps")
+        if isinstance(value, int) and value in self.REFRESH_FPS_OPTIONS:
+            return value
+        return self.DEFAULT_REFRESH_FPS
+
+    def _save_config(self):
         try:
             with open(self.CFG_PATH, "w", encoding="utf-8") as f:
-                f.write(path)
+                json.dump(self.config, f)
         except Exception:
             pass
+
+    def _save_last_folder(self, path: str):
+        self.last_folder = path
+        self.config["last_folder"] = path
+        self._save_config()
+
+    def _set_refresh_fps(self, fps: int, persist: bool = True):
+        if fps not in self.REFRESH_FPS_OPTIONS:
+            fps = self.DEFAULT_REFRESH_FPS
+        self.refresh_fps = fps
+        self._playback_refresh_timer.setInterval(max(1, int(round(1000 / fps))))
+        for option, action in self._refresh_rate_actions.items():
+            action.setChecked(option == fps)
+        if persist:
+            self.config["refresh_fps"] = fps
+            self._save_config()
 
     def _build_ui(self):
         self._setup_menu()
@@ -894,10 +1273,14 @@ class MusicPlayer(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
-        self.table.verticalHeader().setVisible(False)
+        vertical_header = self.table.verticalHeader()
+        assert vertical_header is not None
+        vertical_header.setVisible(False)
+        horizontal_header = self.table.horizontalHeader()
+        assert horizontal_header is not None
         for i in range(6):
-            self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().sectionClicked.connect(self._sort_table)
+            horizontal_header.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
+        horizontal_header.sectionClicked.connect(self._sort_table)
         self.table.itemDoubleClicked.connect(lambda item: self.play_track(item.row()))
         right_l.addWidget(self.table, 1)
 
@@ -964,14 +1347,6 @@ class MusicPlayer(QMainWindow):
         self.normalize_check.setChecked(True)
         self.normalize_check.stateChanged.connect(self._on_normalize_toggled)
         cr.addWidget(self.normalize_check)
-        self.default_view_check = QCheckBox("10s Default View")
-        self.default_view_check.setChecked(True)
-        self.default_view_check.stateChanged.connect(self._on_default_view_toggled)
-        cr.addWidget(self.default_view_check)
-        self.dynamic_check = QCheckBox("Dynamic Waveform")
-        self.dynamic_check.setChecked(True)
-        self.dynamic_check.stateChanged.connect(self._on_dynamic_waveform_toggled)
-        cr.addWidget(self.dynamic_check)
         cr.addSpacing(16)
 
         cr.addWidget(QLabel("Zoom"))
@@ -988,12 +1363,14 @@ class MusicPlayer(QMainWindow):
         self.status_label = QLabel("")
         pb.addWidget(self.status_label)
 
-        self.waveform.set_default_window_limit_ms(10 * 1000)
+        self.waveform.set_default_window_limit_ms(self.DEFAULT_WAVEFORM_WINDOW_MS)
         self._refresh_table()
 
     def _setup_menu(self):
         mb = self.menuBar()
+        assert mb is not None
         file_menu = mb.addMenu("File")
+        assert file_menu is not None
         open_action = QAction("Open Folder", self)
         open_action.triggered.connect(self._open_folder)
         file_menu.addAction(open_action)
@@ -1003,6 +1380,7 @@ class MusicPlayer(QMainWindow):
         file_menu.addAction(exit_action)
 
         playlist_menu = mb.addMenu("Playlist")
+        assert playlist_menu is not None
         save_action = QAction("Save Playlist", self)
         save_action.triggered.connect(self._save_playlist)
         playlist_menu.addAction(save_action)
@@ -1013,7 +1391,24 @@ class MusicPlayer(QMainWindow):
         clear_action.triggered.connect(self._clear_playlist)
         playlist_menu.addAction(clear_action)
 
+        settings_menu = mb.addMenu("Settings")
+        assert settings_menu is not None
+        refresh_menu = settings_menu.addMenu("Waveform Refresh Rate")
+        assert refresh_menu is not None
+        refresh_group = QActionGroup(self)
+        refresh_group.setExclusive(True)
+        self._refresh_rate_actions.clear()
+        for fps in self.REFRESH_FPS_OPTIONS:
+            action = QAction(f"{fps} FPS", self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, value=fps: self._set_refresh_fps(value))
+            refresh_group.addAction(action)
+            refresh_menu.addAction(action)
+            self._refresh_rate_actions[fps] = action
+        self._set_refresh_fps(self.refresh_fps, persist=False)
+
         help_menu = mb.addMenu("Help")
+        assert help_menu is not None
         about_action = QAction("About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -1051,7 +1446,9 @@ class MusicPlayer(QMainWindow):
             self._add_track(path)
 
     def _add_selected_tree_items(self):
-        rows = self.tree.selectionModel().selectedRows()
+        selection_model = self.tree.selectionModel()
+        assert selection_model is not None
+        rows = selection_model.selectedRows()
         for idx in rows:
             path = self.fs_model.filePath(idx)
             if os.path.isdir(path):
@@ -1111,8 +1508,8 @@ class MusicPlayer(QMainWindow):
         for i, v in enumerate(widths):
             self.table.setColumnWidth(i, v)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
+    def resizeEvent(self, a0):
+        super().resizeEvent(a0)
         self._resize_columns()
 
     def _sort_table(self, col: int):
@@ -1213,7 +1610,7 @@ class MusicPlayer(QMainWindow):
         self._last_displayed_second = 0
         self.total_time_label.setText(fmt_seconds(t.duration_s))
         self.table.selectRow(index)
-        self.waveform.set_default_window_limit_ms(10 * 1000 if self.default_10sec_view_enabled else 0)
+        self.waveform.set_default_window_limit_ms(self.DEFAULT_WAVEFORM_WINDOW_MS)
         self.waveform.set_track_duration(t.duration_s * 1000)
         self.waveform.set_follow_playback(False)
         self.waveform.set_loading()
@@ -1235,7 +1632,8 @@ class MusicPlayer(QMainWindow):
         try:
             self.loader.segment_partial.disconnect()
             self.loader.segment_final.disconnect()
-            self.loader.rms_ready.disconnect()
+            self.loader.analysis_ready.disconnect()
+            self.loader.loudness_ready.disconnect()
             self.loader.error.disconnect()
         except Exception:
             pass
@@ -1288,12 +1686,13 @@ class MusicPlayer(QMainWindow):
         key = (track.filepath, q_start, q_end, target_peaks)
 
         if not force and key in self._waveform_cache:
-            peaks, rms = self._waveform_cache[key]
+            peaks, loudness, analysis = self._waveform_cache[key]
             self._waveform_cache.move_to_end(key)
             self.waveform.set_final(q_start, q_end, peaks)
+            self.waveform.set_analysis_data(analysis)
             self._current_waveform_target_peaks = target_peaks
-            if rms is not None:
-                self._on_rms_ready(track.filepath, rms)
+            if loudness is not None:
+                self._on_loudness_ready(track.filepath, loudness["rms"], loudness["peak"])
             self._wave_loaded_for_track = True
             return
 
@@ -1326,7 +1725,8 @@ class MusicPlayer(QMainWindow):
         )
         self.loader.segment_partial.connect(self._on_segment_partial)
         self.loader.segment_final.connect(self._on_segment_final)
-        self.loader.rms_ready.connect(self._on_segment_rms)
+        self.loader.analysis_ready.connect(self._on_segment_analysis)
+        self.loader.loudness_ready.connect(self._on_segment_loudness)
         self.loader.error.connect(self._on_segment_error)
         self.loader.start()
 
@@ -1508,8 +1908,9 @@ class MusicPlayer(QMainWindow):
         mode = meta.get("mode", "full")
         key = self._waveform_request_key_by_id.get(request_id)
         if key is not None and peaks is not None:
-            rms_cached = self._waveform_cache[key][1] if key in self._waveform_cache else None
-            self._waveform_cache[key] = (peaks, rms_cached)
+            loudness_cached = self._waveform_cache[key][1] if key in self._waveform_cache else None
+            analysis_cached = self._waveform_cache[key][2] if key in self._waveform_cache else None
+            self._waveform_cache[key] = (peaks, loudness_cached, analysis_cached)
             self._waveform_cache.move_to_end(key)
             while len(self._waveform_cache) > 8:
                 self._waveform_cache.popitem(last=False)
@@ -1529,7 +1930,17 @@ class MusicPlayer(QMainWindow):
         self._waveform_request_meta_by_id.pop(request_id, None)
         self._waveform_request_key_by_id.pop(request_id, None)
 
-    def _on_segment_rms(self, rms: float, request_id: int):
+    def _on_segment_analysis(self, analysis: WaveformAnalysis, request_id: int):
+        if request_id != self.waveform_request_id:
+            return
+        key = self._waveform_request_key_by_id.get(request_id)
+        if key is not None:
+            peaks_cached = self._waveform_cache[key][0] if key in self._waveform_cache else None
+            loudness_cached = self._waveform_cache[key][1] if key in self._waveform_cache else None
+            self._waveform_cache[key] = (peaks_cached, loudness_cached, analysis)
+        self.waveform.set_analysis_data(analysis)
+
+    def _on_segment_loudness(self, rms: float, peak: float, request_id: int):
         if request_id != self.waveform_request_id:
             return
         if self.current_track_index < 0:
@@ -1537,9 +1948,9 @@ class MusicPlayer(QMainWindow):
         fp = self.playlist[self.current_track_index].filepath
         key = self._waveform_request_key_by_id.get(request_id)
         if key is not None and key in self._waveform_cache:
-            peaks, _ = self._waveform_cache[key]
-            self._waveform_cache[key] = (peaks, rms)
-        self._on_rms_ready(fp, rms)
+            peaks, _, analysis = self._waveform_cache[key]
+            self._waveform_cache[key] = (peaks, {"rms": rms, "peak": peak}, analysis)
+        self._on_loudness_ready(fp, rms, peak)
 
     def _on_segment_error(self, msg: str, request_id: int):
         if request_id != self.waveform_request_id:
@@ -1547,26 +1958,13 @@ class MusicPlayer(QMainWindow):
         self.status_label.setText(msg)
         self.waveform.set_error(msg)
 
-    def _on_rms_ready(self, filepath: str, rms: float):
-        self.track_rms[filepath] = rms
+    def _on_loudness_ready(self, filepath: str, rms: float, peak: float):
+        self.track_loudness[filepath] = {"rms": rms, "peak": peak}
         self._apply_volume()
 
     def _on_normalize_toggled(self, state: int):
         self.normalize_enabled = bool(state)
         self._apply_volume()
-
-    def _on_default_view_toggled(self, state: int):
-        self.default_10sec_view_enabled = bool(state)
-        self.waveform.set_default_window_limit_ms(10 * 1000 if self.default_10sec_view_enabled else 0)
-        if self.current_track_index >= 0:
-            duration_ms = self.playlist[self.current_track_index].duration_s * 1000
-            self.waveform.set_track_duration(duration_ms)
-            self.zoom_slider.setValue(self.waveform.get_zoom_level())
-
-    def _on_dynamic_waveform_toggled(self, state: int):
-        self.dynamic_waveform_enabled = bool(state)
-        if self.current_track_index >= 0:
-            self._schedule_full_waveform_request(force=True, immediate=True)
 
     def _apply_volume(self):
         base = self.volume_slider.value() / 100.0
@@ -1574,11 +1972,18 @@ class MusicPlayer(QMainWindow):
             self.audio_output.setVolume(base)
             return
         fp = self.playlist[self.current_track_index].filepath
-        rms = self.track_rms.get(fp)
-        if not rms or rms <= 0:
+        loudness = self.track_loudness.get(fp)
+        if not loudness:
             self.audio_output.setVolume(base)
             return
-        gain = self.target_rms / rms
+        rms = loudness["rms"]
+        peak = loudness["peak"]
+        if rms <= 0 or peak <= 0:
+            self.audio_output.setVolume(base)
+            return
+        desired_gain = max(1.0, self.target_rms / rms)
+        peak_limited_gain = max(1.0, self.target_peak / peak)
+        gain = min(self.max_normalize_gain, desired_gain, peak_limited_gain)
         self.audio_output.setVolume(max(0.0, min(1.0, base * gain)))
 
     def _show_about(self):
@@ -1590,6 +1995,7 @@ class MusicPlayer(QMainWindow):
             "Features:\n"
             "- Full waveform rendered in one pass\n"
             "- Centered playhead follow mode\n"
+            "- Live loudness and BPM overlays\n"
             "- Visible timeline scale\n"
             "- Mouse wheel and slider zoom\n"
             "- Right-drag panning\n"
@@ -1597,11 +2003,11 @@ class MusicPlayer(QMainWindow):
             "- Playlist save/load (.m3u)\n",
         )
 
-    def closeEvent(self, event):
+    def closeEvent(self, a0):
         self._playback_refresh_timer.stop()
         self._stop_loader()
         self.player.stop()
-        super().closeEvent(event)
+        super().closeEvent(a0)
 
 
 def main():
