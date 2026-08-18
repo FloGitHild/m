@@ -14,8 +14,8 @@ import numpy as np
 from mutagen.mp3 import MP3
 from mutagen import MutagenError
 
-from PyQt6.QtCore import Qt, QDir, QUrl, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QAction, QActionGroup, QColor, QPainter, QPen, QFileSystemModel
+from PyQt6.QtCore import Qt, QDir, QRect, QUrl, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QPainter, QPen, QPixmap, QFileSystemModel
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -460,9 +460,264 @@ class WaveformView(QWidget):
         self._peak_hold_right = 0.0
         self._peak_hold_last_ts = time.perf_counter()
         self._current_bpm = 0.0
+        self._paint_cache_key: tuple[int, int, int, int, int, int] | None = None
+        self._paint_left_cache = np.empty(0, dtype=np.float32)
+        self._paint_right_cache = np.empty(0, dtype=np.float32)
+        self._static_layer_key: tuple[int, int, int, int, int, int, int, str] | None = None
+        self._static_layer_pixmap: QPixmap | None = None
+        self._wave_layer_key: tuple[int, int, int, int, int, int, int] | None = None
+        self._wave_layer_pixmap: QPixmap | None = None
 
         self.setMinimumHeight(100)
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+
+    def _invalidate_paint_cache(self):
+        self._paint_cache_key = None
+        self._paint_left_cache = np.empty(0, dtype=np.float32)
+        self._paint_right_cache = np.empty(0, dtype=np.float32)
+        self._invalidate_static_layer()
+        self._invalidate_wave_layer()
+
+    def _invalidate_static_layer(self):
+        self._static_layer_key = None
+        self._static_layer_pixmap = None
+
+    def _invalidate_wave_layer(self):
+        self._wave_layer_key = None
+        self._wave_layer_pixmap = None
+
+    @staticmethod
+    def _union_rect(base: QRect | None, extra: QRect) -> QRect:
+        return extra if base is None else base.united(extra)
+
+    def _hud_height(self) -> int:
+        return 36
+
+    def _minimap_height(self) -> int:
+        return 8
+
+    def _wave_rect(self) -> QRect:
+        hud_h = self._hud_height()
+        mini_h = self._minimap_height()
+        draw_h = max(24, self.height() - mini_h - hud_h)
+        return QRect(0, hud_h, self.width(), draw_h)
+
+    def _hud_rect(self) -> QRect:
+        return QRect(0, 0, self.width(), self._hud_height())
+
+    def _line_dirty_rect(self, x: int, top: int, bottom: int, thickness: int = 4) -> QRect | None:
+        if x < 0:
+            return None
+        width = self.width()
+        if width <= 0 or bottom <= top:
+            return None
+        left = max(0, x - thickness)
+        right = min(width, x + thickness + 1)
+        if right <= left:
+            return None
+        return QRect(left, top, right - left, bottom - top)
+
+    def _request_overlay_update(
+        self,
+        prev_playhead_x: int = -1,
+        new_playhead_x: int = -1,
+        prev_hover_x: int = -1,
+        new_hover_x: int = -1,
+        hud_changed: bool = False,
+        full: bool = False,
+    ):
+        if full:
+            self.update()
+            return
+        dirty: QRect | None = self._hud_rect() if hud_changed else None
+        wave_rect = self._wave_rect()
+        wave_top = wave_rect.y()
+        wave_bottom = wave_top + wave_rect.height()
+        for x in (prev_playhead_x, new_playhead_x, prev_hover_x, new_hover_x):
+            rect = self._line_dirty_rect(x, wave_top, wave_bottom)
+            if rect is not None:
+                dirty = self._union_rect(dirty, rect)
+        if dirty is not None:
+            self.update(dirty)
+
+    def _get_paint_arrays(self, width: int) -> tuple[np.ndarray, np.ndarray]:
+        if self._peaks is None or self._duration_ms <= 0 or width <= 0:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+        left_peaks, right_peaks = self._peaks
+        n = min(len(left_peaks), len(right_peaks))
+        if n <= 0:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+        key = (
+            width,
+            self._view_start_ms,
+            self._view_end_ms,
+            self._segment_start_ms,
+            self._segment_end_ms,
+            n,
+        )
+        if self._paint_cache_key == key:
+            return self._paint_left_cache, self._paint_right_cache
+
+        seg_span = max(1, self._segment_end_ms - self._segment_start_ms)
+        view_span = max(1, self._view_end_ms - self._view_start_ms)
+        times = self._view_start_ms + np.linspace(0.0, view_span, num=width, dtype=np.float32)
+        mask = (times >= self._segment_start_ms) & (times <= self._segment_end_ms)
+        sampled_left = np.zeros(width, dtype=np.float32)
+        sampled_right = np.zeros(width, dtype=np.float32)
+        if np.any(mask):
+            ratios = (times[mask] - self._segment_start_ms) / seg_span
+            indices = np.clip((ratios * (n - 1)).astype(np.int32), 0, n - 1)
+            sampled_left[mask] = left_peaks[indices]
+            sampled_right[mask] = right_peaks[indices]
+        self._paint_cache_key = key
+        self._paint_left_cache = sampled_left
+        self._paint_right_cache = sampled_right
+        return sampled_left, sampled_right
+
+    @staticmethod
+    def _draw_wave_columns(
+        p: QPainter,
+        left_render: np.ndarray,
+        right_render: np.ndarray,
+        x_start: int,
+        x_end: int,
+        height: int,
+    ):
+        if x_end <= x_start:
+            return
+        center = height // 2
+        wave_half = max(1, center - 3)
+        blue = QPen(QColor(40, 120, 255, 110), 1)
+        yellow = QPen(QColor(255, 220, 70, 110), 1)
+        green = QPen(QColor(80, 230, 90, 150), 1)
+        for x in range(x_start, min(x_end, len(left_render), len(right_render))):
+            lv = float(left_render[x])
+            rv = float(right_render[x])
+            if lv <= 0.0 and rv <= 0.0:
+                continue
+            lamp = max(1, int(lv * wave_half))
+            ramp = max(1, int(rv * wave_half))
+            oamp = min(lamp, ramp)
+            p.setPen(blue)
+            p.drawLine(x, center - lamp, x, center + lamp)
+            p.setPen(yellow)
+            p.drawLine(x, center - ramp, x, center + ramp)
+            p.setPen(green)
+            p.drawLine(x, center - oamp, x, center + oamp)
+
+    def _ensure_wave_layer(self, width: int, height: int):
+        if self._peaks is None or self._duration_ms <= 0 or width <= 0 or height <= 0:
+            self._wave_layer_key = None
+            self._wave_layer_pixmap = None
+            return
+        left_render, right_render = self._get_paint_arrays(width)
+        n = min(len(left_render), len(right_render))
+        key = (
+            width,
+            height,
+            self._view_start_ms,
+            self._view_end_ms,
+            self._segment_start_ms,
+            self._segment_end_ms,
+            n,
+        )
+        if self._wave_layer_key == key and self._wave_layer_pixmap is not None:
+            return
+        pixmap = QPixmap(width, height)
+        pixmap.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        self._draw_wave_columns(p, left_render, right_render, 0, width, height)
+        p.end()
+        self._wave_layer_key = key
+        self._wave_layer_pixmap = pixmap
+
+    def _try_shift_wave_layer(self, prev_start: int, prev_end: int) -> bool:
+        wave_rect = self._wave_rect()
+        width = wave_rect.width()
+        height = wave_rect.height()
+        if (
+            self._wave_layer_pixmap is None
+            or self._wave_layer_key is None
+            or self._peaks is None
+            or width <= 0
+            or height <= 0
+        ):
+            return False
+        prev_span = max(1, prev_end - prev_start)
+        new_span = max(1, self._view_end_ms - self._view_start_ms)
+        if prev_span != new_span:
+            return False
+        ms_per_px = prev_span / max(1, width)
+        shift_px = int(round((prev_start - self._view_start_ms) / ms_per_px))
+        if shift_px == 0 or abs(shift_px) >= width:
+            return False
+
+        left_render, right_render = self._get_paint_arrays(width)
+        n = min(len(left_render), len(right_render))
+        new_pixmap = QPixmap(width, height)
+        new_pixmap.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(new_pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.drawPixmap(shift_px, 0, self._wave_layer_pixmap)
+        if shift_px < 0:
+            self._draw_wave_columns(painter, left_render, right_render, width + shift_px, width, height)
+        else:
+            self._draw_wave_columns(painter, left_render, right_render, 0, shift_px, height)
+        painter.end()
+        self._wave_layer_pixmap = new_pixmap
+        self._wave_layer_key = (
+            width,
+            height,
+            self._view_start_ms,
+            self._view_end_ms,
+            self._segment_start_ms,
+            self._segment_end_ms,
+            n,
+        )
+        return True
+
+    def _ensure_static_layer(self, width: int, height: int, hud_h: int, mini_h: int):
+        key = (
+            width,
+            height,
+            hud_h,
+            mini_h,
+            self._view_start_ms,
+            self._view_end_ms,
+            self._duration_ms,
+            self._status,
+        )
+        if self._static_layer_key == key and self._static_layer_pixmap is not None:
+            return
+
+        pixmap = QPixmap(width, height)
+        pixmap.fill(QColor(16, 16, 16))
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        draw_top = hud_h
+        draw_h = max(24, height - mini_h - draw_top)
+        center = draw_top + (draw_h // 2)
+
+        p.fillRect(0, 0, width, hud_h, QColor(10, 10, 10))
+        p.setPen(QPen(QColor(42, 42, 42), 1))
+        p.drawLine(0, hud_h - 1, width, hud_h - 1)
+        p.drawLine(0, center, width, center)
+
+        if self._peaks is None or self._duration_ms <= 0:
+            if self._status:
+                p.setPen(QPen(QColor(120, 120, 120), 1))
+                p.drawText(0, draw_top, width, draw_h, Qt.AlignmentFlag.AlignCenter, self._status)
+
+        self._draw_time_scale(p, width, draw_top)
+        self._draw_minimap(p, width, height, mini_h)
+        p.end()
+        self._static_layer_key = key
+        self._static_layer_pixmap = pixmap
 
     def set_default_window_limit_ms(self, limit_ms: int):
         self._default_window_limit_ms = max(0, limit_ms)
@@ -487,9 +742,10 @@ class WaveformView(QWidget):
         self._segment_end_ms = end_ms
         self._peaks = peaks
         self._loading = loading
+        self._invalidate_paint_cache()
         if peaks is not None:
             self._status = ""
-        self.update()
+        self._request_overlay_update(full=True)
 
     def preview_stretch_to_view(self, start_ms: int, end_ms: int, target_peaks: int):
         seg = self.get_segment_data()
@@ -519,9 +775,10 @@ class WaveformView(QWidget):
     def set_track_duration(self, duration_ms: int):
         self._duration_ms = max(0, duration_ms)
         self._set_default_initial_view()
+        self._invalidate_paint_cache()
         self.zoom_changed.emit(self._zoom_level)
         self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
-        self.update()
+        self._request_overlay_update(full=True)
 
     def clear_analysis(self):
         self._levels = np.empty(0, dtype=np.float32)
@@ -539,7 +796,7 @@ class WaveformView(QWidget):
         self._peak_hold_right = 0.0
         self._peak_hold_last_ts = time.perf_counter()
         self._current_bpm = 0.0
-        self.update()
+        self._request_overlay_update(full=True)
 
     def set_analysis_data(self, analysis: WaveformAnalysis | None):
         if not analysis:
@@ -571,7 +828,8 @@ class WaveformView(QWidget):
         self._loading = True
         self._status = "Loading waveform ..."
         self.clear_analysis()
-        self.update()
+        self._invalidate_paint_cache()
+        self._request_overlay_update(full=True)
 
     def clear_for_view(self, start_ms: int, end_ms: int):
         self._segment_start_ms = start_ms
@@ -579,14 +837,16 @@ class WaveformView(QWidget):
         self._peaks = None
         self._loading = True
         self._status = "Loading waveform ..."
+        self._invalidate_paint_cache()
         self.clear_analysis()
-        self.update()
+        self._request_overlay_update(full=True)
 
     def set_error(self, msg: str):
         self._loading = False
         if self._peaks is None:
             self._status = msg
-        self.update()
+        self._invalidate_paint_cache()
+        self._request_overlay_update(full=True)
 
     def set_partial(self, start_ms: int, end_ms: int, peaks):
         if peaks is None:
@@ -603,19 +863,56 @@ class WaveformView(QWidget):
         self._segment_end_ms = end_ms
         self._peaks = peaks
         self._loading = False
+        self._invalidate_paint_cache()
         if peaks is None:
             self._status = "Waveform unavailable"
         else:
             self._status = ""
-        self.update()
+        self._request_overlay_update(full=True)
 
     def set_position(self, ms: int):
+        prev_x = self._ms_to_x(self._position_ms) if self._duration_ms > 0 else -1
+        prev_hover_x = self._hover_x
+        prev_left = self._display_left_level
+        prev_right = self._display_right_level
+        prev_peak_left = self._peak_hold_left
+        prev_peak_right = self._peak_hold_right
+        prev_bpm = self._current_bpm
+        prev_view = (self._view_start_ms, self._view_end_ms)
         self._position_ms = max(0, ms)
         self._update_analysis_position()
+        viewport_moved = False
         if not self._drag_seek:
-            if self._auto_scroll() and not self._follow_playback:
+            viewport_moved = self._auto_scroll()
+            if viewport_moved and not self._follow_playback:
                 self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
-        self.update()
+        if viewport_moved or prev_view != (self._view_start_ms, self._view_end_ms):
+            self._invalidate_paint_cache()
+        new_x = self._ms_to_x(self._position_ms) if self._duration_ms > 0 else -1
+        if (
+            not viewport_moved
+            and prev_x == new_x
+            and abs(prev_left - self._display_left_level) < 0.002
+            and abs(prev_right - self._display_right_level) < 0.002
+            and abs(prev_peak_left - self._peak_hold_left) < 0.002
+            and abs(prev_peak_right - self._peak_hold_right) < 0.002
+            and abs(prev_bpm - self._current_bpm) < 0.05
+        ):
+            return
+        self._request_overlay_update(
+            prev_playhead_x=prev_x,
+            new_playhead_x=new_x,
+            prev_hover_x=prev_hover_x,
+            new_hover_x=self._hover_x,
+            hud_changed=(
+                abs(prev_left - self._display_left_level) >= 0.002
+                or abs(prev_right - self._display_right_level) >= 0.002
+                or abs(prev_peak_left - self._peak_hold_left) >= 0.002
+                or abs(prev_peak_right - self._peak_hold_right) >= 0.002
+                or abs(prev_bpm - self._current_bpm) >= 0.05
+            ),
+            full=viewport_moved or prev_view != (self._view_start_ms, self._view_end_ms),
+        )
 
     def _update_analysis_position(self):
         now = time.perf_counter()
@@ -663,16 +960,18 @@ class WaveformView(QWidget):
         level = max(1, min(100, int(level)))
         self._zoom_level = level
         self._apply_zoom_around_center()
+        self._invalidate_paint_cache()
         self.zoom_changed.emit(level)
         self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
-        self.update()
+        self._request_overlay_update(full=True)
 
     def reset_zoom(self):
         self._zoom_level = 1
         self._set_default_initial_view()
+        self._invalidate_paint_cache()
         self.zoom_changed.emit(self._zoom_level)
         self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
-        self.update()
+        self._request_overlay_update(full=True)
 
     def wheelEvent(self, a0):
         assert a0 is not None
@@ -701,10 +1000,17 @@ class WaveformView(QWidget):
             self._update_edge_scroll_state(self._edge_anchor_x)
             ms = self._x_to_ms(a0.position().x())
             self.seek_preview.emit(ms)
-            self.update()
+            self._request_overlay_update(
+                prev_playhead_x=self._ms_to_x(self._position_ms),
+                new_playhead_x=self._ms_to_x(ms),
+                prev_hover_x=self._hover_x,
+                new_hover_x=self._hover_x,
+            )
 
     def mouseMoveEvent(self, a0):
         assert a0 is not None
+        prev_hover_x = self._hover_x
+        prev_pos_x = self._ms_to_x(self._position_ms) if self._duration_ms > 0 else -1
         x = int(a0.position().x())
         self._hover_x = x
         if self._drag_seek:
@@ -723,9 +1029,16 @@ class WaveformView(QWidget):
             self._set_view_window(start, end)
             self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
             self._update_edge_scroll_state(-1)
+            self._request_overlay_update(full=True)
+            return
         else:
             self._update_edge_scroll_state(-1)
-        self.update()
+        self._request_overlay_update(
+            prev_playhead_x=prev_pos_x,
+            new_playhead_x=self._ms_to_x(self._position_ms) if self._duration_ms > 0 else -1,
+            prev_hover_x=prev_hover_x,
+            new_hover_x=self._hover_x,
+        )
 
     def mouseReleaseEvent(self, a0):
         assert a0 is not None
@@ -734,22 +1047,31 @@ class WaveformView(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
         if a0.button() == Qt.MouseButton.LeftButton and self._drag_seek:
+            prev_pos_x = self._ms_to_x(self._position_ms) if self._duration_ms > 0 else -1
             self._drag_seek = False
             self._update_edge_scroll_state(-1)
             ms = self._position_ms
             self.seek_commit.emit(ms)
-            self.update()
+            self._request_overlay_update(
+                prev_playhead_x=prev_pos_x,
+                new_playhead_x=self._ms_to_x(ms) if self._duration_ms > 0 else -1,
+                prev_hover_x=self._hover_x,
+                new_hover_x=self._hover_x,
+            )
 
     def leaveEvent(self, a0):
+        prev_hover_x = self._hover_x
         self._hover_x = -1
         if not self._drag_seek:
             self._update_edge_scroll_state(-1)
-        self.update()
+        self._request_overlay_update(prev_hover_x=prev_hover_x, new_hover_x=-1)
 
     def resizeEvent(self, a0):
         super().resizeEvent(a0)
+        self._invalidate_paint_cache()
         if self._duration_ms > 0:
             self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
+        self._request_overlay_update(full=True)
 
     def _min_window_ms(self) -> int:
         if self._duration_ms <= 0:
@@ -797,12 +1119,26 @@ class WaveformView(QWidget):
             self._view_start_ms = 0
             self._view_end_ms = 0
             return
+        prev_start = self._view_start_ms
+        prev_end = self._view_end_ms
         span = max(1, end - start)
         max_start = max(0, self._duration_ms - span)
         start = max(0, min(max_start, start))
         end = start + span
         self._view_start_ms = start
         self._view_end_ms = min(self._duration_ms, end)
+        if (prev_start, prev_end) != (self._view_start_ms, self._view_end_ms):
+            self._invalidate_static_layer()
+            if not self._try_shift_wave_layer(prev_start, prev_end):
+                self._paint_cache_key = None
+                self._paint_left_cache = np.empty(0, dtype=np.float32)
+                self._paint_right_cache = np.empty(0, dtype=np.float32)
+                self._invalidate_wave_layer()
+
+    def _quantize_follow_start(self, start: int, span: int) -> int:
+        width = max(1, self.width())
+        ms_per_px = max(1.0, span / width)
+        return int(round(start / ms_per_px) * ms_per_px)
 
     def _auto_scroll(self) -> bool:
         if self._duration_ms <= 0:
@@ -820,7 +1156,7 @@ class WaveformView(QWidget):
                 return prev != (self._view_start_ms, self._view_end_ms)
             # Center playhead in the view
             center = self._position_ms
-            start = center - span // 2
+            start = self._quantize_follow_start(center - span // 2, span)
             prev = (self._view_start_ms, self._view_end_ms)
             self._set_view_window(start, start + span)
             return prev != (self._view_start_ms, self._view_end_ms)
@@ -894,7 +1230,7 @@ class WaveformView(QWidget):
             self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
             self._position_ms = self._x_to_ms(self._edge_anchor_x)
             self.seek_preview.emit(self._position_ms)
-            self.update()
+            self._request_overlay_update(full=True)
     def _x_to_ms(self, x: float) -> int:
         if self._duration_ms <= 0:
             return 0
@@ -925,53 +1261,12 @@ class WaveformView(QWidget):
         draw_top = hud_h
         draw_h = max(24, h - mini_h - draw_top)
         draw_bottom = draw_top + draw_h
-        center = draw_top + (draw_h // 2)
-        wave_half = max(1, (draw_h // 2) - 3)
-
-        p.fillRect(0, 0, w, h, QColor(16, 16, 16))
-        p.fillRect(0, 0, w, hud_h, QColor(10, 10, 10))
-        p.setPen(QPen(QColor(42, 42, 42), 1))
-        p.drawLine(0, hud_h - 1, w, hud_h - 1)
-        p.drawLine(0, center, w, center)
-
-        if self._peaks is not None and self._duration_ms > 0:
-            left_peaks, right_peaks = self._peaks
-            n = min(len(left_peaks), len(right_peaks))
-            if n <= 0:
-                left_peaks = np.empty(0, dtype=np.float32)
-                right_peaks = np.empty(0, dtype=np.float32)
-                n = 0
-            blue = QPen(QColor(40, 120, 255, 110), 1)
-            yellow = QPen(QColor(255, 220, 70, 110), 1)
-            green = QPen(QColor(80, 230, 90, 150), 1)
-            seg_span = max(1, self._segment_end_ms - self._segment_start_ms)
-            view_span = max(1, self._view_end_ms - self._view_start_ms)
-            for x in range(w):
-                if n <= 0:
-                    break
-                t = self._view_start_ms + int((x / max(1, w - 1)) * view_span)
-                if t < self._segment_start_ms or t > self._segment_end_ms:
-                    continue
-                r = (t - self._segment_start_ms) / seg_span
-                idx = int(max(0.0, min(1.0, r)) * (n - 1))
-                lv = float(left_peaks[idx])
-                rv = float(right_peaks[idx])
-                lamp = max(1, int(lv * wave_half))
-                ramp = max(1, int(rv * wave_half))
-                oamp = min(lamp, ramp)
-                p.setPen(blue)
-                p.drawLine(x, center - lamp, x, center + lamp)
-                p.setPen(yellow)
-                p.drawLine(x, center - ramp, x, center + ramp)
-                p.setPen(green)
-                p.drawLine(x, center - oamp, x, center + oamp)
-        else:
-            msg = self._status
-            if msg:
-                p.setPen(QPen(QColor(120, 120, 120), 1))
-                p.drawText(0, draw_top, w, draw_h, Qt.AlignmentFlag.AlignCenter, msg)
-
-        self._draw_time_scale(p, w, draw_top)
+        self._ensure_static_layer(w, h, hud_h, mini_h)
+        if self._static_layer_pixmap is not None:
+            p.drawPixmap(0, 0, self._static_layer_pixmap)
+        self._ensure_wave_layer(w, draw_h)
+        if self._wave_layer_pixmap is not None:
+            p.drawPixmap(0, draw_top, self._wave_layer_pixmap)
 
         if self._duration_ms > 0:
             pos_x = self._ms_to_x(self._position_ms)
@@ -981,11 +1276,9 @@ class WaveformView(QWidget):
         if self._hover_x >= 0 and not self._drag_pan and not self._drag_seek:
             p.setPen(QPen(QColor(255, 255, 255, 50), 1))
             p.drawLine(self._hover_x, draw_top, self._hover_x, draw_bottom - 1)
-
         self._draw_level_meter(p, w, hud_h)
         self._draw_recent_level_graph(p, hud_h)
         self._draw_perf_overlay(p, w, hud_h)
-        self._draw_minimap(p, w, h, mini_h)
         p.end()
 
     def _draw_stereo_meter_row(self, p: QPainter, x: int, y: int, w: int, h: int, label: str, level: float, peak_hold: float):
@@ -2011,6 +2304,8 @@ class MusicPlayer(QMainWindow):
 
 
 def main():
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     w = MusicPlayer()
     w.show()
