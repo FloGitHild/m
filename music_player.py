@@ -46,6 +46,8 @@ except ImportError:
 
 
 class WaveformAnalysis(TypedDict):
+    start_ms: int
+    end_ms: int
     levels: np.ndarray
     left_levels: np.ndarray
     right_levels: np.ndarray
@@ -125,7 +127,8 @@ class WaveformSegmentLoader(QThread):
         target_peaks = max(200, target_peaks)
         desired_samples_per_peak = 12
         rate = int((target_peaks * desired_samples_per_peak) / window_sec)
-        return max(4000, min(48000, rate))
+        # Long tracks should not require multi-kHz decoding just to build a zoomed-out overview.
+        return max(1000, min(48000, rate))
 
     @staticmethod
     def _to_peaks(samples: np.ndarray, target_peaks: int) -> np.ndarray:
@@ -274,6 +277,8 @@ class WaveformSegmentLoader(QThread):
             right_levels = np.sqrt(right_levels).astype(np.float32, copy=False)
         bpm_times_ms, bpm_values = self._estimate_local_bpms(levels, levels_hz)
         return {
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
             "levels": levels.astype(np.float32, copy=False),
             "left_levels": left_levels.astype(np.float32, copy=False),
             "right_levels": right_levels.astype(np.float32, copy=False),
@@ -449,6 +454,8 @@ class WaveformView(QWidget):
         self._left_levels = np.empty(0, dtype=np.float32)
         self._right_levels = np.empty(0, dtype=np.float32)
         self._levels_hz = 0
+        self._analysis_start_ms = 0
+        self._analysis_end_ms = 0
         self._bpm_times_ms = np.empty(0, dtype=np.int32)
         self._bpm_values = np.empty(0, dtype=np.float32)
         self._current_level = 0.0
@@ -737,6 +744,20 @@ class WaveformView(QWidget):
             return None
         return self._segment_start_ms, self._segment_end_ms, self._peaks
 
+    def get_analysis_data(self) -> WaveformAnalysis | None:
+        if self._levels_hz <= 0 or not self._levels.size:
+            return None
+        return {
+            "start_ms": self._analysis_start_ms,
+            "end_ms": self._analysis_end_ms,
+            "levels": self._levels.copy(),
+            "left_levels": self._left_levels.copy(),
+            "right_levels": self._right_levels.copy(),
+            "levels_hz": self._levels_hz,
+            "bpm_times_ms": self._bpm_times_ms.copy(),
+            "bpm_values": self._bpm_values.copy(),
+        }
+
     def set_segment_data(self, start_ms: int, end_ms: int, peaks, loading: bool = False):
         self._segment_start_ms = start_ms
         self._segment_end_ms = end_ms
@@ -785,6 +806,8 @@ class WaveformView(QWidget):
         self._left_levels = np.empty(0, dtype=np.float32)
         self._right_levels = np.empty(0, dtype=np.float32)
         self._levels_hz = 0
+        self._analysis_start_ms = 0
+        self._analysis_end_ms = 0
         self._bpm_times_ms = np.empty(0, dtype=np.int32)
         self._bpm_values = np.empty(0, dtype=np.float32)
         self._current_level = 0.0
@@ -806,6 +829,8 @@ class WaveformView(QWidget):
         self._left_levels = np.asarray(analysis["left_levels"], dtype=np.float32)
         self._right_levels = np.asarray(analysis["right_levels"], dtype=np.float32)
         self._levels_hz = int(analysis["levels_hz"])
+        self._analysis_start_ms = int(analysis["start_ms"])
+        self._analysis_end_ms = int(analysis["end_ms"])
         self._bpm_times_ms = np.asarray(analysis["bpm_times_ms"], dtype=np.int32)
         self._bpm_values = np.asarray(analysis["bpm_values"], dtype=np.float32)
         self._update_analysis_position()
@@ -827,7 +852,8 @@ class WaveformView(QWidget):
     def set_loading(self):
         self._loading = True
         self._status = "Loading waveform ..."
-        self.clear_analysis()
+        if self._peaks is None:
+            self.clear_analysis()
         self._invalidate_paint_cache()
         self._request_overlay_update(full=True)
 
@@ -884,7 +910,7 @@ class WaveformView(QWidget):
         viewport_moved = False
         if not self._drag_seek:
             viewport_moved = self._auto_scroll()
-            if viewport_moved and not self._follow_playback:
+            if viewport_moved:
                 self.viewport_changed.emit(self._view_start_ms, self._view_end_ms)
         if viewport_moved or prev_view != (self._view_start_ms, self._view_end_ms):
             self._invalidate_paint_cache()
@@ -921,8 +947,14 @@ class WaveformView(QWidget):
         self._current_level = 0.0
         self._current_left_level = 0.0
         self._current_right_level = 0.0
-        if self._levels_hz > 0 and self._levels.size:
-            idx = int((self._position_ms / 1000.0) * self._levels_hz)
+        if (
+            self._levels_hz > 0
+            and self._levels.size
+            and self._analysis_end_ms > self._analysis_start_ms
+            and self._analysis_start_ms <= self._position_ms <= self._analysis_end_ms
+        ):
+            rel_ms = self._position_ms - self._analysis_start_ms
+            idx = int((rel_ms / 1000.0) * self._levels_hz)
             idx = max(0, min(len(self._levels) - 1, idx))
             self._current_level = float(self._levels[idx])
             if self._left_levels.size:
@@ -1341,13 +1373,20 @@ class WaveformView(QWidget):
         p.fillRect(box_x, box_y, box_w, box_h, QColor(0, 0, 0, 150))
         p.setPen(QPen(QColor(80, 80, 80), 1))
         p.drawRect(box_x, box_y, box_w, box_h)
-        if self._levels_hz <= 0 or not self._levels.size:
+        if (
+            self._levels_hz <= 0
+            or not self._levels.size
+            or self._analysis_end_ms <= self._analysis_start_ms
+            or self._position_ms < self._analysis_start_ms
+            or self._position_ms > self._analysis_end_ms
+        ):
             return
         history_ms = 500
-        end_idx = int((self._position_ms / 1000.0) * self._levels_hz)
+        end_idx = int(((self._position_ms - self._analysis_start_ms) / 1000.0) * self._levels_hz)
         span = max(1, int((history_ms / 1000.0) * self._levels_hz))
         start_idx = max(0, end_idx - span + 1)
-        window = self._levels[start_idx:end_idx + 1]
+        end_idx = max(0, min(len(self._levels) - 1, end_idx))
+        window = self._levels[start_idx : end_idx + 1]
         if window.size <= 1:
             return
         p.setPen(QPen(QColor(80, 255, 160), 1))
@@ -1405,7 +1444,7 @@ class WaveformView(QWidget):
 
 class MusicPlayer(QMainWindow):
     MAX_WAVEFORM_PEAKS = 600_000
-    DEFAULT_WAVEFORM_WINDOW_MS = 10 * 1000
+    DEFAULT_WAVEFORM_WINDOW_MS = 10 * 60 * 1000
     DEFAULT_REFRESH_FPS = 60
     REFRESH_FPS_OPTIONS = (30, 60, 120, 144)
 
@@ -1424,6 +1463,7 @@ class MusicPlayer(QMainWindow):
         self.waveform_request_id = 0
         self._waveform_request_key_by_id: dict[int, tuple] = {}
         self._waveform_request_meta_by_id: dict[int, dict] = {}
+        self._active_waveform_request_id = 0
         self._active_waveform_request_key: tuple | None = None
         self._waveform_cache: OrderedDict[tuple, tuple[object, LoudnessMetrics | None, WaveformAnalysis | None]] = OrderedDict()
         self._pending_waveform_request: tuple[int, int, str] | None = None
@@ -1908,16 +1948,18 @@ class MusicPlayer(QMainWindow):
         self.waveform.set_follow_playback(False)
         self.waveform.set_loading()
         self.waveform.set_position(0)
-        self.zoom_slider.setValue(1)
+        self._on_waveform_zoom_changed(self.waveform.get_zoom_level())
         self.status_label.setText("")
         self._set_playback_anchor(0)
-        self._schedule_full_waveform_request(force=True, immediate=True)
+        start_ms, end_ms = self.waveform.get_viewport_ms()
+        self._ensure_waveform_coverage(start_ms, end_ms, immediate=True)
 
         self.player.setSource(QUrl.fromLocalFile(t.filepath))
         self.player.play()
         self._apply_volume()
 
     def _stop_loader(self):
+        self._active_waveform_request_id = 0
         self._active_waveform_request_key = None
         if self.loader is None:
             return
@@ -1956,6 +1998,69 @@ class MusicPlayer(QMainWindow):
             return
         duration_ms = max(1, self.playlist[self.current_track_index].duration_s * 1000)
         self._schedule_waveform_request(0, duration_ms, force=force, immediate=immediate)
+
+    def _schedule_visible_waveform_request(self, force: bool = False, immediate: bool = False):
+        if self.current_track_index < 0:
+            return
+        duration_ms = max(1, self.playlist[self.current_track_index].duration_s * 1000)
+        start_ms, end_ms = self.waveform.get_viewport_ms()
+        if end_ms <= start_ms:
+            start_ms, end_ms = 0, duration_ms
+        self._schedule_waveform_request(start_ms, end_ms, force=force, immediate=immediate)
+
+    def _expanded_waveform_request_range(self, start_ms: int, end_ms: int, duration_ms: int) -> tuple[int, int]:
+        span = max(1, end_ms - start_ms)
+        pad_left = max(1000, span // 2)
+        pad_right = max(1000, span)
+        req_start = max(0, start_ms - pad_left)
+        req_end = min(duration_ms, end_ms + pad_right)
+        if req_end <= req_start:
+            req_end = min(duration_ms, req_start + span)
+        return req_start, req_end
+
+    def _active_request_covers(self, start_ms: int, end_ms: int, target_peaks: int) -> bool:
+        if self._active_waveform_request_id <= 0:
+            return False
+        meta = self._waveform_request_meta_by_id.get(self._active_waveform_request_id)
+        if not meta:
+            return False
+        return (
+            int(meta.get("target_peaks", 0)) == target_peaks
+            and int(meta.get("q_start", 0)) <= start_ms
+            and int(meta.get("q_end", 0)) >= end_ms
+        )
+
+    def _ensure_waveform_coverage(self, start_ms: int, end_ms: int, immediate: bool = False):
+        if self.current_track_index < 0:
+            return
+        duration_ms = max(1, self.playlist[self.current_track_index].duration_s * 1000)
+        desired_target_peaks = self._adaptive_target_peaks(duration_ms)
+        req_start, req_end = self._expanded_waveform_request_range(start_ms, end_ms, duration_ms)
+        seg = self.waveform.get_segment_data()
+
+        if seg is not None:
+            seg_start, seg_end, _ = seg
+            if (
+                seg_start <= req_start
+                and seg_end >= req_end
+                and self._current_waveform_target_peaks == desired_target_peaks
+            ):
+                return
+            if self._current_waveform_target_peaks == desired_target_peaks:
+                if self._active_request_covers(req_start, req_end, desired_target_peaks):
+                    return
+                if req_start < seg_start and req_end > seg_end:
+                    self._schedule_waveform_request(req_start, req_end, force=False, immediate=immediate, mode="full")
+                    return
+                if req_start < seg_start:
+                    self._schedule_waveform_request(req_start, seg_start, force=False, immediate=immediate, mode="extend_left")
+                    return
+                if req_end > seg_end:
+                    self._schedule_waveform_request(seg_end, req_end, force=False, immediate=immediate, mode="extend_right")
+                    return
+
+        if not self._active_request_covers(req_start, req_end, desired_target_peaks):
+            self._schedule_waveform_request(req_start, req_end, force=not self._wave_loaded_for_track, immediate=immediate)
 
     def _adaptive_target_peaks(self, duration_ms: int) -> int:
         width_px = max(1, self.waveform.width())
@@ -2004,6 +2109,7 @@ class MusicPlayer(QMainWindow):
             "q_end": q_end,
             "target_peaks": target_peaks,
         }
+        self._active_waveform_request_id = request_id
         self._active_waveform_request_key = key
         self.waveform.set_loading()
 
@@ -2062,6 +2168,59 @@ class MusicPlayer(QMainWindow):
             out_l[i] = float(left[idx])
             out_r[i] = float(right[idx])
         return out_l, out_r
+
+    @staticmethod
+    def _merge_analysis_segments(base: WaveformAnalysis | None, add: WaveformAnalysis) -> WaveformAnalysis:
+        if base is None:
+            return add
+        if int(base["levels_hz"]) != int(add["levels_hz"]):
+            return add
+
+        levels_hz = int(add["levels_hz"])
+        bs = int(base["start_ms"])
+        be = int(base["end_ms"])
+        ns = int(add["start_ms"])
+        ne = int(add["end_ms"])
+        if ne <= bs:
+            base, add = add, base
+            bs, be, ns, ne = ns, ne, bs, be
+
+        base_levels = np.asarray(base["levels"], dtype=np.float32)
+        base_left = np.asarray(base["left_levels"], dtype=np.float32)
+        base_right = np.asarray(base["right_levels"], dtype=np.float32)
+        add_levels = np.asarray(add["levels"], dtype=np.float32)
+        add_left = np.asarray(add["left_levels"], dtype=np.float32)
+        add_right = np.asarray(add["right_levels"], dtype=np.float32)
+
+        if ns < be:
+            overlap = max(0, be - ns)
+            add_span = max(1, ne - ns)
+            drop = int((overlap / add_span) * len(add_levels))
+            drop = max(0, min(len(add_levels), drop))
+            add_levels = add_levels[drop:]
+            add_left = add_left[drop:]
+            add_right = add_right[drop:]
+            ns = min(ne, ns + int(round((drop / max(1, levels_hz)) * 1000.0)))
+
+        base_bpm_times = np.asarray(base["bpm_times_ms"], dtype=np.int32)
+        base_bpm_values = np.asarray(base["bpm_values"], dtype=np.float32)
+        add_bpm_times = np.asarray(add["bpm_times_ms"], dtype=np.int32)
+        add_bpm_values = np.asarray(add["bpm_values"], dtype=np.float32)
+        base_mask = base_bpm_times < ns
+        add_mask = add_bpm_times >= ns
+        bpm_times = np.concatenate((base_bpm_times[base_mask], add_bpm_times[add_mask]))
+        bpm_values = np.concatenate((base_bpm_values[base_mask], add_bpm_values[add_mask]))
+
+        return {
+            "start_ms": bs,
+            "end_ms": max(be, ne),
+            "levels": np.concatenate((base_levels, add_levels)).astype(np.float32, copy=False),
+            "left_levels": np.concatenate((base_left, add_left)).astype(np.float32, copy=False),
+            "right_levels": np.concatenate((base_right, add_right)).astype(np.float32, copy=False),
+            "levels_hz": levels_hz,
+            "bpm_times_ms": bpm_times.astype(np.int32, copy=False),
+            "bpm_values": bpm_values.astype(np.float32, copy=False),
+        }
 
     def toggle_play(self):
         if not self.playlist:
@@ -2129,7 +2288,7 @@ class MusicPlayer(QMainWindow):
             start, end = self.waveform.get_viewport_ms()
             if end <= start:
                 self.waveform.set_track_duration(ms)
-            self._schedule_full_waveform_request(force=not self._wave_loaded_for_track, immediate=True)
+            self._ensure_waveform_coverage(*self.waveform.get_viewport_ms(), immediate=True)
 
     def _on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -2177,16 +2336,7 @@ class MusicPlayer(QMainWindow):
     def _on_waveform_viewport_changed(self, start_ms: int, end_ms: int):
         if self.current_track_index < 0:
             return
-        duration_ms = max(1, self.playlist[self.current_track_index].duration_s * 1000)
-        desired_target_peaks = self._adaptive_target_peaks(duration_ms)
-        seg = self.waveform.get_segment_data()
-
-        if seg is not None:
-            seg_start, seg_end, _ = seg
-            if seg_start <= 0 and seg_end >= duration_ms and self._current_waveform_target_peaks == desired_target_peaks:
-                return
-
-        self._schedule_full_waveform_request(force=not self._wave_loaded_for_track, immediate=False)
+        self._ensure_waveform_coverage(start_ms, end_ms, immediate=False)
 
     def _on_segment_partial(self, start_ms: int, end_ms: int, peaks, request_id: int):
         # Suppress progressive rendering - waveform will appear all at once when final arrives
@@ -2197,6 +2347,9 @@ class MusicPlayer(QMainWindow):
     def _on_segment_final(self, start_ms: int, end_ms: int, peaks, request_id: int):
         if request_id != self.waveform_request_id:
             return
+        if request_id == self._active_waveform_request_id:
+            self._active_waveform_request_id = 0
+            self._active_waveform_request_key = None
         meta = self._waveform_request_meta_by_id.get(request_id, {})
         mode = meta.get("mode", "full")
         key = self._waveform_request_key_by_id.get(request_id)
@@ -2208,7 +2361,9 @@ class MusicPlayer(QMainWindow):
             while len(self._waveform_cache) > 8:
                 self._waveform_cache.popitem(last=False)
 
-        if peaks is None:
+        if peaks is None and (mode == "extend_left" or mode == "extend_right") and self.waveform.get_segment_data() is not None:
+            pass
+        elif peaks is None:
             self.waveform.set_final(start_ms, end_ms, peaks)
         elif mode == "extend_left" or mode == "extend_right":
             base = self.waveform.get_segment_data()
@@ -2226,12 +2381,18 @@ class MusicPlayer(QMainWindow):
     def _on_segment_analysis(self, analysis: WaveformAnalysis, request_id: int):
         if request_id != self.waveform_request_id:
             return
+        meta = self._waveform_request_meta_by_id.get(request_id, {})
+        mode = meta.get("mode", "full")
         key = self._waveform_request_key_by_id.get(request_id)
         if key is not None:
             peaks_cached = self._waveform_cache[key][0] if key in self._waveform_cache else None
             loudness_cached = self._waveform_cache[key][1] if key in self._waveform_cache else None
             self._waveform_cache[key] = (peaks_cached, loudness_cached, analysis)
-        self.waveform.set_analysis_data(analysis)
+        if mode == "extend_left" or mode == "extend_right":
+            merged_analysis = self._merge_analysis_segments(self.waveform.get_analysis_data(), analysis)
+            self.waveform.set_analysis_data(merged_analysis)
+        else:
+            self.waveform.set_analysis_data(analysis)
 
     def _on_segment_loudness(self, rms: float, peak: float, request_id: int):
         if request_id != self.waveform_request_id:
@@ -2248,6 +2409,9 @@ class MusicPlayer(QMainWindow):
     def _on_segment_error(self, msg: str, request_id: int):
         if request_id != self.waveform_request_id:
             return
+        if request_id == self._active_waveform_request_id:
+            self._active_waveform_request_id = 0
+            self._active_waveform_request_key = None
         self.status_label.setText(msg)
         self.waveform.set_error(msg)
 
